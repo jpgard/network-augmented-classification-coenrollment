@@ -1,0 +1,11 @@
+"model","acc"
+"acc_ensemble_neuralnet_test",0.662275800678043
+"acc_ensemble_xgboost_test",0.661139415519233
+"acc_flat_test",0.654008998342411
+"acc_full_test",0.653705896282264
+"acc_ml_test",0.642339569026758
+"acc_cl_test",0.641828084300261
+"acc_bl_test",0.639696897939853
+"acc_ml_nn_test",0.638134027942221
+"acc_bl_nn_test",0.635207198673928
+"acc_cl_nn_test",0.63425053279659

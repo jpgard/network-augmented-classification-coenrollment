@@ -1,0 +1,400 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+
+# Copyright (C) 2017  The Regents of the University of Michigan
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+#    This program is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#
+#    You should have received a copy of the GNU General Public License
+#    along with this program.  If not, see [http://www.gnu.org/licenses/].
+# ========================================================================
+# setup; load modules and read data; save preprocessed data
+
+DATA_FP = c("../nw_1970.csv", "../nw_1920.csv", "../nw_1870.csv", "../nw_1820.csv", "../nw_1770.csv",
+"../nw_1720.csv",
+"../nw_1670.csv",
+"../nw_1620.csv",
+"../nw_1570.csv",
+"../nw_1520.csv"
+            )
+TESTDATA_FP = "../nw_2020.csv"
+## DROP_COLS contains names of columns that should be dropped from the input data file; this includes any field that should not be included in models
+## note that DROP_COLS are dropped after filtering is applied in read_data
+DROP_COLS = c("X.SNPSHT_RPT_DT_x", "TERM_CD", "TERM_SHORT_DES_x", "X.SNPSHT_RPT_DT_y", "TERM_SHORT_DES_y", "GRD_BASIS_ENRL_CD", "GRD_BASIS_ENRL_DES", 
+              "CLASS_LONG_DES", "CLASS_GRDD_IND", "EXCL_CLASS_CURR_GPA", "EXCL_CLASS_CUM_GPA", "GRD_PNTS_PER_UNIT_NBR", "GRD_PNTS", "CLASS_MTG_START_DT", 
+              "CLASS_MTG_END_DT", "CLASS_MTG_START_TM", "CLASS_MTG_END_TM", "CURR_GPA", "CUM_GPA", "CRSE_GRD_INPUT_CD", "MAX_UMPLC_MATH_TEST_SCR", "CLASS_NBR", "LAST_TERM_ATTND_CD")
+
+source("preproc_utils.R")
+source("modeling_utils.R")
+traindata = read_data(DATA_FP, impute = "none") %>% make_grades_coarse() %>% apply_unique_grade_thresh()
+# note that testdata will likely have larger proportion of missing data; this is because it is forced to retain any columns in traindata even if they exceeded the proportion of missing observations for apply_drop_thresh()
+testdata = read_data(TESTDATA_FP, impute = "none", keep_train_cols = names(traindata)) %>% make_grades_coarse() %>% select(one_of(names(traindata))) # TODO: confirm apply_unique_grade_thresh() isn't needed for test data
+# keep columns same in traindata and testdata; different amounts of observed cardinality b/w datasets can sometimes cause different columns to be retained
+traindata = select(traindata, one_of(names(testdata)))
+testdata = match_train_levels(traindata, testdata)
+save(traindata, testdata, file = "processed_data.Rdata")
+```
+
+```{r}
+# model training
+
+# optional; load preprocessed data
+# load("processed_data.Rdata")
+# create training datasets
+#flat
+flat_train_data = select(traindata, -matches("^CL_|^ML_|^BL_"))
+# neighbor (coenrollment)
+net_ml_train_data = select(traindata, matches("^ML_|CRSE_GRD_OFFCL_CD|SBJCT_CD")) %>% select(-matches("_NBR"))
+net_cl_train_data = select(traindata, matches("^CL_|CRSE_GRD_OFFCL_CD|SBJCT_CD")) %>% select(-matches("_NBR"))
+net_bl_train_data = select(traindata, matches("^BL_|CRSE_GRD_OFFCL_CD|SBJCT_CD")) %>% select(-matches("_NBR"))
+# nearest neighbor (same-course)
+net_ml_nn_train_data = select(traindata, matches("^ML_NBR|CRSE_GRD_OFFCL_CD|SBJCT_CD"))
+net_cl_nn_train_data = select(traindata, matches("^CL_BIN_NBR|CRSE_GRD_OFFCL_CD|SBJCT_CD"))
+net_bl_nn_train_data = select(traindata, matches("^BL_BIN_NBR|CRSE_GRD_OFFCL_CD|SBJCT_CD"))
+# build flat feature model; returns list with one model per category of models_by variable 
+flat_mods = build_mods(flat_train_data, models_by = "SBJCT_CD", model_type = "rf") #TODO: cross-validation of these models
+full_mods = build_mods(traindata, models_by = "SBJCT_CD", model_type = "rf")
+save(flat_mods, file = "flat_mods.Rdata")
+save(full_mods, file = "full_mods.Rdata")
+# build network feature model; each link type is handled separately to avoid nested lists
+ml_mods = build_mods(net_ml_train_data, models_by = "SBJCT_CD", model_type = "glm") # TODO: debug training issue with these models
+cl_mods = build_mods(net_cl_train_data, models_by = "SBJCT_CD", model_type = "glm") 
+bl_mods = build_mods(net_bl_train_data, models_by = "SBJCT_CD", model_type = "glm") 
+# build nearest neighbor (same-course) network models
+ml_nn_mods = build_mods(net_ml_nn_train_data, models_by = "SBJCT_CD", model_type = "glm")
+cl_nn_mods = build_mods(net_cl_nn_train_data, models_by = "SBJCT_CD", model_type = "glm")
+bl_nn_mods = build_mods(net_bl_nn_train_data, models_by = "SBJCT_CD", model_type = "glm")
+save(ml_mods, cl_mods, bl_mods, ml_nn_mods, cl_nn_mods, bl_nn_mods, file = "net_mods.Rdata")
+```
+
+```{r}
+# create testing datasets
+# TODO: remove COGSCI filter after debugging; COGSCI for some reason is not appearing in any of the _nn_ mods due to not appearing when they call levels()
+# flat
+flat_test_data = select(testdata, -matches("^CL_|^ML_|^BL_")) %>% filter(SBJCT_CD != "COGSCI")
+# neighbor (coenrollment)
+net_ml_test_data = select(testdata, matches("^ML_|CRSE_GRD_OFFCL_CD|SBJCT_CD")) %>% filter(SBJCT_CD != "COGSCI")
+net_cl_test_data = select(testdata, matches("^CL_|CRSE_GRD_OFFCL_CD|SBJCT_CD")) %>% filter(SBJCT_CD != "COGSCI")
+net_bl_test_data = select(testdata, matches("^BL_|CRSE_GRD_OFFCL_CD|SBJCT_CD")) %>% filter(SBJCT_CD != "COGSCI")
+# nearest neighbor (same-course)
+net_ml_nn_test_data = select(testdata, matches("^ML_NBR|CRSE_GRD_OFFCL_CD|SBJCT_CD")) %>% filter(SBJCT_CD != "COGSCI")
+net_cl_nn_test_data = select(testdata, matches("^CL_BIN_NBR|CRSE_GRD_OFFCL_CD|SBJCT_CD")) %>% filter(SBJCT_CD != "COGSCI")
+net_bl_nn_test_data = select(testdata, matches("^BL_BIN_NBR|CRSE_GRD_OFFCL_CD|SBJCT_CD")) %>% filter(SBJCT_CD != "COGSCI")
+save(flat_test_data, net_ml_test_data, net_cl_test_data, net_bl_test_data, net_ml_nn_test_data, net_cl_nn_test_data, net_bl_nn_test_data, file="processed_test_data.Rdata")
+```
+
+
+```{r}
+library(tibble)
+
+# predict on testing data =========================================================================
+P_c = table(flat_train_data$CRSE_GRD_OFFCL_CD)/nrow(flat_train_data)
+# precompute oa preds to provide to each structural model; this is predicted class probability for each test observation according to flat model (so it is not duplicated in calls to struct_predict() below)
+# note that test_oa_preds[["oa_preds"]] is needed to access the actual predicted probabilities
+flat_scruct_predict = struct_predict(oa_df = flat_test_data, la_df = NULL, oa_mods = flat_mods, la_mods = NULL, pred_type = "oa_preds") #, test_obs = NUM_TEST_OBS
+
+test_oa_preds = flat_scruct_predict[["oa_preds"]]
+
+#flat model (from precomputed preds)
+acc_flat_test = sum(flat_scruct_predict[["oa_pred_df"]]$CRSE_GRD_OFFCL_CD == sapply(test_oa_preds, function(x) names(which.max(x))))/length(test_oa_preds)
+
+# full model
+full_preds_test = struct_predict(oa_df = filter(testdata, SBJCT_CD != "COGSCI"), la_df = NULL, oa_mods = full_mods, la_mods = NULL, pred_type = "flat")
+acc_full_test = sum(full_preds_test[["oa_pred_df"]] == full_preds_test[["preds"]])/length(full_preds_test[["preds"]])
+
+# count-link; (no nn) 
+cl_preds_test = struct_predict(oa_df = flat_test_data, la_df = net_cl_test_data, la_nn_df = net_cl_nn_test_data, oa_mods = flat_mods, la_mods = cl_mods, la_nn_mods = cl_nn_mods, pred_type = "struct", oa_preds = test_oa_preds, class_probs = P_c) 
+acc_cl_test = sum(cl_preds_test[["oa_pred_df"]]$CRSE_GRD_OFFCL_CD == cl_preds_test[["preds"]])/length(test_oa_preds)
+
+# binary-link; (no nn) 
+bl_preds_test = struct_predict(oa_df = flat_test_data, la_df = net_bl_test_data, la_nn_df = net_bl_nn_test_data, oa_mods = flat_mods, la_mods = bl_mods, la_nn_mods = bl_nn_mods, pred_type = "struct", oa_preds = test_oa_preds, class_probs = P_c) 
+acc_bl_test = sum(bl_preds_test[["oa_pred_df"]]$CRSE_GRD_OFFCL_CD == bl_preds_test[["preds"]])/length(test_oa_preds)
+
+# mean-link; (no nn)  
+ml_preds_test = struct_predict(oa_df = flat_test_data, la_df = net_ml_test_data, la_nn_df = net_ml_nn_test_data, oa_mods = flat_mods, la_mods = ml_mods, la_nn_mods = ml_nn_mods, pred_type = "struct", oa_preds = test_oa_preds, class_probs = P_c) 
+acc_ml_test = sum(ml_preds_test[["oa_pred_df"]]$CRSE_GRD_OFFCL_CD == ml_preds_test[["preds"]])/length(test_oa_preds)
+
+# count-link nn
+cl_nn_preds_test = struct_predict(oa_df = flat_test_data, la_df = net_cl_test_data, la_nn_df = net_cl_nn_test_data, oa_mods = flat_mods, la_mods = cl_mods, la_nn_mods = cl_nn_mods, pred_type = "struct_nn", oa_preds = test_oa_preds, class_probs = P_c) 
+acc_cl_nn_test = sum(cl_nn_preds_test[["oa_pred_df"]]$CRSE_GRD_OFFCL_CD == cl_nn_preds_test[["preds"]])/length(test_oa_preds)
+
+# binary-link nn
+bl_nn_preds_test = struct_predict(oa_df = flat_test_data, la_df = net_bl_test_data, la_nn_df = net_bl_nn_test_data, oa_mods = flat_mods, la_mods = bl_mods, la_nn_mods = bl_nn_mods, pred_type = "struct_nn", oa_preds = test_oa_preds, class_probs = P_c) 
+acc_bl_nn_test = sum(bl_nn_preds_test[["oa_pred_df"]]$CRSE_GRD_OFFCL_CD == bl_nn_preds_test[["preds"]])/length(test_oa_preds)
+
+# mean-link nn
+ml_nn_preds_test = struct_predict(oa_df = flat_test_data, la_df = net_ml_test_data, la_nn_df = net_ml_nn_test_data, oa_mods = flat_mods, la_mods = ml_mods, la_nn_mods = ml_nn_mods, pred_type = "struct_nn", oa_preds = test_oa_preds, class_probs = P_c) 
+acc_ml_nn_test = sum(ml_nn_preds_test[["oa_pred_df"]]$CRSE_GRD_OFFCL_CD == ml_nn_preds_test[["preds"]])/length(test_oa_preds)
+
+test_results = data.frame(t(data.frame(acc_flat_test, acc_full_test, acc_cl_test, acc_bl_test, acc_ml_test, acc_cl_nn_test, acc_bl_nn_test, acc_ml_nn_test)))
+names(test_results) <- "acc"
+test_results %<>% rownames_to_column(var = "model") %>% arrange(desc(acc))
+test_results
+write.csv(test_results, file = "test_results.csv", row.names = FALSE)
+```
+
+
+```{r}
+library(caret)
+library(pROC)
+# multiclass AUC
+flat_preds = sapply(test_oa_preds, function(x) names(which.max(x)))
+flat_labs = flat_scruct_predict[["oa_pred_df"]]$CRSE_GRD_OFFCL_CD
+mm_list = list()
+# fetch multiclass metrics for each set of predictions and labels
+mm_list[["flat"]] = fetch_multiclass_metrics(flat_labs, flat_preds)
+mm_list[["full"]] = fetch_multiclass_metrics(labs = full_preds_test[["oa_pred_df"]]$CRSE_GRD_OFFCL_CD, preds =full_preds_test[["preds"]])
+mm_list[["cl"]] = fetch_multiclass_metrics(labs = cl_preds_test[["oa_pred_df"]]$CRSE_GRD_OFFCL_CD, preds = cl_preds_test[["preds"]])
+mm_list[["bl"]] = fetch_multiclass_metrics(labs = bl_preds_test[["oa_pred_df"]]$CRSE_GRD_OFFCL_CD, preds = bl_preds_test[["preds"]])
+mm_list[["ml"]] = fetch_multiclass_metrics(labs = ml_preds_test[["oa_pred_df"]]$CRSE_GRD_OFFCL_CD, preds = ml_preds_test[["preds"]])
+mm_list[["cl_nn"]] = fetch_multiclass_metrics(labs = cl_nn_preds_test[["oa_pred_df"]]$CRSE_GRD_OFFCL_CD, preds = cl_nn_preds_test[["preds"]])
+mm_list[["bl_nn"]] = fetch_multiclass_metrics(labs = bl_nn_preds_test[["oa_pred_df"]]$CRSE_GRD_OFFCL_CD, preds = bl_nn_preds_test[["preds"]])
+mm_list[["ml_nn"]] = fetch_multiclass_metrics(labs = ml_nn_preds_test[["oa_pred_df"]]$CRSE_GRD_OFFCL_CD, preds = ml_nn_preds_test[["preds"]])
+mm = bind_rows(mm_list, .id = "model")
+mm
+write.csv(mm, file = "multiclass_metrics.csv", row.names = FALSE)
+```
+
+
+```{r}
+# blended model; https://mlwave.com/kaggle-ensembling-guide/; http://www.stat.osu.edu/~dmsl/GrandPrize2009_BPC_BigChaos.pdf
+
+## build training and probe datasets ===============================================================================
+library(caret)
+set.seed(2974)
+in_blend_train = createDataPartition(traindata$SBJCT_CD, p = 0.75, list = FALSE)
+blend_traindata = traindata[in_blend_train,]
+blend_probedata = traindata[-in_blend_train,] %>% filter(SBJCT_CD != "COGSCI")
+
+#flat
+flat_blend_train_data = select(blend_traindata, -matches("^CL_|^ML_|^BL_"))
+flat_blend_probe_data = select(blend_probedata, -matches("^CL_|^ML_|^BL_"))
+# neighbor (coenrollment)
+net_ml_blend_train_data = select(blend_traindata, matches("^ML_|CRSE_GRD_OFFCL_CD|SBJCT_CD")) %>% select(-matches("_NBR"))
+net_cl_blend_train_data = select(blend_traindata, matches("^CL_|CRSE_GRD_OFFCL_CD|SBJCT_CD")) %>% select(-matches("_NBR"))
+net_bl_blend_train_data = select(blend_traindata, matches("^BL_|CRSE_GRD_OFFCL_CD|SBJCT_CD")) %>% select(-matches("_NBR"))
+net_ml_blend_probe_data = select(blend_probedata, matches("^ML_|CRSE_GRD_OFFCL_CD|SBJCT_CD")) %>% select(-matches("_NBR"))
+net_cl_blend_probe_data = select(blend_probedata, matches("^CL_|CRSE_GRD_OFFCL_CD|SBJCT_CD")) %>% select(-matches("_NBR"))
+net_bl_blend_probe_data = select(blend_probedata, matches("^BL_|CRSE_GRD_OFFCL_CD|SBJCT_CD")) %>% select(-matches("_NBR"))
+# nearest neighbor (same-course)
+net_ml_nn_blend_train_data = select(blend_traindata, matches("^ML_NBR|CRSE_GRD_OFFCL_CD|SBJCT_CD")) 
+net_cl_nn_blend_train_data = select(blend_traindata, matches("^CL_BIN_NBR|CRSE_GRD_OFFCL_CD|SBJCT_CD"))
+net_bl_nn_blend_train_data = select(blend_traindata, matches("^BL_BIN_NBR|CRSE_GRD_OFFCL_CD|SBJCT_CD"))
+net_ml_nn_blend_probe_data = select(blend_probedata, matches("^ML_NBR|CRSE_GRD_OFFCL_CD|SBJCT_CD"))
+net_cl_nn_blend_probe_data = select(blend_probedata, matches("^CL_BIN_NBR|CRSE_GRD_OFFCL_CD|SBJCT_CD"))
+net_bl_nn_blend_probe_data = select(blend_probedata, matches("^BL_BIN_NBR|CRSE_GRD_OFFCL_CD|SBJCT_CD"))
+
+# build models on blend_traindata; this excludes probe set
+# flat
+flat_blend_mods = build_mods(flat_blend_train_data, models_by = "SBJCT_CD", model_type = "rf") 
+full_blend_mods = build_mods(blend_traindata, models_by = "SBJCT_CD", model_type = "rf")
+save(flat_blend_mods, file = "flat_blend_mods.Rdata")
+save(full_blend_mods, file = "full_blend_mods.Rdata")
+# network
+ml_blend_mods = build_mods(net_ml_blend_train_data, models_by = "SBJCT_CD", model_type = "glm") 
+cl_blend_mods = build_mods(net_cl_blend_train_data, models_by = "SBJCT_CD", model_type = "glm") 
+bl_blend_mods = build_mods(net_bl_blend_train_data, models_by = "SBJCT_CD", model_type = "glm") 
+# nearest neighbor (same-course) network models
+ml_nn_blend_mods = build_mods(net_ml_nn_blend_train_data, models_by = "SBJCT_CD", model_type = "glm")
+cl_nn_blend_mods = build_mods(net_cl_nn_blend_train_data, models_by = "SBJCT_CD", model_type = "glm")
+bl_nn_blend_mods = build_mods(net_bl_nn_blend_train_data, models_by = "SBJCT_CD", model_type = "glm")
+save(ml_blend_mods, cl_blend_mods, bl_blend_mods, ml_nn_blend_mods, cl_nn_blend_mods, bl_nn_blend_mods, file = "net_blend_mods.Rdata")
+
+# build blended classifier on probe set using predictions from blend_traindata =========================================================
+# get predictions on probe data to build blended model
+P_c = table(flat_blend_train_data$CRSE_GRD_OFFCL_CD)/nrow(flat_blend_train_data)
+# flat blended predictions
+flat_blend_predict = struct_predict(oa_df = flat_blend_probe_data, la_df = NULL, oa_mods = flat_blend_mods, la_mods = NULL, pred_type = "oa_preds") 
+flat_probe_preds = flat_blend_predict[["oa_preds"]]
+# count-link; (no nn) 
+cl_probe_preds = struct_predict(oa_df = flat_blend_probe_data, la_df = net_cl_blend_probe_data, oa_mods =  flat_blend_mods, la_mods = cl_blend_mods, pred_type = "la_preds", class_probs = P_c)[["la_preds"]]
+# binary-link; (no nn) 
+bl_probe_preds = struct_predict(oa_df = flat_blend_probe_data, la_df = net_bl_blend_probe_data, oa_mods =  flat_blend_mods, la_mods = bl_blend_mods, pred_type = "la_preds", class_probs = P_c)[["la_preds"]] 
+# mean-link; (no nn)  
+ml_probe_preds = struct_predict(oa_df = flat_blend_probe_data, la_df = net_ml_blend_probe_data, oa_mods =  flat_blend_mods, la_mods = ml_blend_mods, pred_type = "la_preds", class_probs = P_c)[["la_preds"]]
+
+# count link nn
+cl_nn_probe_preds = struct_predict(oa_df = flat_blend_probe_data, la_df = NULL, oa_mods =  flat_blend_mods, la_mods = cl_blend_mods, la_nn_mods = cl_nn_blend_mods, la_nn_df = net_cl_nn_blend_probe_data, pred_type = "la_nn_preds", class_probs = P_c)[["la_nn_preds"]]
+# # mean link nn
+ml_nn_probe_preds = struct_predict(oa_df = flat_blend_probe_data, la_df = NULL, oa_mods =  flat_blend_mods, la_mods = ml_blend_mods, la_nn_mods = ml_nn_blend_mods, la_nn_df = net_ml_nn_blend_probe_data, pred_type = "la_nn_preds", class_probs = P_c)[["la_nn_preds"]]
+# # binary link nn
+bl_nn_probe_preds = struct_predict(oa_df = flat_blend_probe_data, la_df = NULL, oa_mods =  flat_blend_mods, la_mods = bl_blend_mods, la_nn_mods = bl_nn_blend_mods, la_nn_df = net_bl_nn_blend_probe_data, pred_type = "la_nn_preds", class_probs = P_c)[["la_nn_preds"]]
+# build single dataframe from all probe predictions - TODO: add nn models here
+probe_preds = list("flat" = flat_probe_preds, "cl" = cl_probe_preds, "bl" = bl_probe_preds, "ml" = ml_probe_preds, "cl_nn" = cl_nn_probe_preds, "bl_nn" = bl_nn_probe_preds, "ml_nn" = ml_nn_probe_preds)
+
+probe_preds = lapply(probe_preds, function(x) do.call("rbind", x))
+probe_preds = make_probe_df(probe_preds) # TODO: test
+probe_preds["CRSE_GRD_OFFCL_CD"] = flat_blend_predict[["oa_pred_df"]]$CRSE_GRD_OFFCL_CD # creates label column for probe df
+save(flat_blend_predict, flat_probe_preds, bl_probe_preds, ml_probe_preds, cl_probe_preds, probe_preds, file = "probe_preds.Rdata")
+```
+
+```{r}
+# train meta-learner model
+
+# xgboost =====================================================================================================================================
+# refer to https://rpubs.com/mharris/multiclass_xgboost
+library(xgboost)
+X = as.matrix(subset(probe_preds, select = -c(CRSE_GRD_OFFCL_CD)))
+Y = as.numeric(probe_preds$CRSE_GRD_OFFCL_CD) - 1
+train_matrix = xgb.DMatrix(data = X, label = Y)
+num_classes <- length(unique(Y))
+xgb_params <- list("objective" = "multi:softprob",
+                   "eval_metric" = "mlogloss",
+                   "num_class" = numberOfClasses)
+nround    <- 50 # number of XGBoost rounds
+cv.nfold  <- 5
+# Fit cv.nfold * cv.nround XGB models and save OOF predictions; this is used to estimate OOB error; TODO: use CV to find best hyperparam settings
+ensemble_xgb_cv <- xgb.cv(params = xgb_params,
+                   data = train_matrix, 
+                   nrounds = nround,
+                   nfold = cv.nfold,
+                   verbose = 1,
+                   prediction = TRUE)
+# model diagnostics
+OOF_prediction <- data.frame(ensemble_xgb_cv$pred) %>%
+  mutate(max_prob = max.col(., ties.method = "last"),
+         label = Y + 1)
+confusionMatrix(factor(OOF_prediction$label), 
+                factor(OOF_prediction$max_prob),
+                mode = "everything")
+
+# train final xbgoost model using best CV params (currently, this just fits same model as above)
+ensemble_xgb <- xgb.train(params = xgb_params, data = train_matrix, nrounds = nround, verbose = 1)
+save(ensemble_xgb,X,Y, file = 'ensemble_xgb.Rdata')
+# neural net ===================================================================================================================================
+N_LAYERS = 2 # number of layers for neuralnet; later this will be parameter passed to function
+TRAIN_THRESH = 2.5
+library(neuralnet)
+# TODO: test this function
+train_nn = make_nn_matrix(probe_preds)
+ensemble_nn = neuralnet(
+    paste(paste(train_nn[["y_names"]], collapse='+'),
+          '~',
+          paste(train_nn[["x_names"]], collapse='+')),
+    train_nn[["mx"]],
+    hidden = rep(length(train_nn[["x_names"]]), N_LAYERS),
+    linear.output=FALSE,
+    lifesign='full', 
+    lifesign.step=100,
+    threshold = TRAIN_THRESH
+    )
+# get result on training data
+ensemble_nn_train_preds = predict_nn(ensemble_nn, X)
+table(Predicted = ensemble_nn_train_preds, Expected = probe_preds$CRSE_GRD_OFFCL_CD)
+ensemble_nn_acc = sum(ensemble_nn_train_preds == as.numeric(probe_preds$CRSE_GRD_OFFCL_CD) - 1)/length(ensemble_nn_train_preds)
+ensemble_nn_acc
+save(ensemble_nn, file="ensemble_nn.Rdata")
+```
+
+
+```{r}
+# ensemble predictions on test data - xgboost
+
+# get class probabilities from TRAIN data; this is unknown for test data in real-world
+P_c = table(flat_blend_train_data$CRSE_GRD_OFFCL_CD)/nrow(flat_blend_train_data)
+# fetch individual model predictions on test data
+# flat blended predictions
+flat_test_predict = struct_predict(oa_df = flat_test_data, la_df = NULL, oa_mods = flat_blend_mods, la_mods = NULL, pred_type = "oa_preds") 
+flat_test_preds = flat_test_predict[["oa_preds"]]
+# count-link; (no nn) 
+cl_test_preds = struct_predict(oa_df = flat_test_data, la_df = net_cl_test_data, oa_mods =  flat_blend_mods, la_mods = cl_blend_mods, pred_type = "la_preds", class_probs = P_c)[["la_preds"]]
+# binary-link; (no nn) 
+bl_test_preds = struct_predict(oa_df = flat_test_data, la_df = net_bl_test_data, oa_mods =  flat_blend_mods, la_mods = bl_blend_mods, pred_type = "la_preds", class_probs = P_c)[["la_preds"]]
+# mean-link; (no nn)  
+ml_test_preds = struct_predict(oa_df = flat_test_data, la_df = net_ml_test_data, oa_mods =  flat_blend_mods, la_mods = ml_blend_mods, pred_type = "la_preds", class_probs = P_c)[["la_preds"]]
+
+# count-link nn
+cl_nn_test_preds = struct_predict(oa_df = flat_test_data, la_df = net_cl_test_data, oa_mods =  flat_blend_mods, la_mods = cl_blend_mods, la_nn_df = net_cl_nn_test_data, la_nn_mods = cl_nn_blend_mods, pred_type = "la_nn_preds", class_probs = P_c)[["la_nn_preds"]]
+# binary-link nn
+bl_nn_test_preds = struct_predict(oa_df = flat_test_data, la_df = net_bl_test_data, oa_mods =  flat_blend_mods, la_mods = bl_blend_mods, la_nn_df = net_bl_nn_test_data, la_nn_mods = bl_nn_blend_mods, pred_type = "la_nn_preds", class_probs = P_c)[["la_nn_preds"]]
+# mean-link nn
+ml_nn_test_preds = struct_predict(oa_df = flat_test_data, la_df = net_ml_test_data, oa_mods =  flat_blend_mods, la_mods = ml_blend_mods, la_nn_df = net_ml_nn_test_data, la_nn_mods = ml_nn_blend_mods, pred_type = "la_nn_preds", class_probs = P_c)[["la_nn_preds"]]
+
+# build single dataframe from all test predictions
+test_preds = list("flat" = flat_test_preds, "cl" = cl_test_preds, "bl" = bl_test_preds, "ml" = ml_test_preds, "cl_nn" = cl_nn_test_preds, "bl_nn" = bl_nn_test_preds, "ml_nn" = ml_nn_test_preds)
+test_preds = lapply(test_preds, function(x) do.call("rbind", x))
+test_preds = make_probe_df(test_preds) # TODO: test
+test_preds["CRSE_GRD_OFFCL_CD"] = flat_test_predict[["oa_pred_df"]]$CRSE_GRD_OFFCL_CD # creates label column 
+save(flat_test_predict, flat_test_preds, bl_test_preds, ml_test_preds, cl_test_preds, test_preds, file = "base_test_preds.Rdata")
+
+# predict in xgboost ensemble model
+X_test = as.matrix(subset(test_preds, select = -c(CRSE_GRD_OFFCL_CD)))
+Y_test = as.numeric(test_preds$CRSE_GRD_OFFCL_CD) - 1
+test_matrix = xgb.DMatrix(data = X_test, label = Y_test)
+ensemble_xgb_test_preds = predict(ensemble_xgb, newdata = test_matrix)
+xgb_test_prediction <- matrix(ensemble_xgb_test_preds, nrow = num_classes, ncol=length(ensemble_xgb_test_preds)/num_classes) %>%
+    t() %>%
+    data.frame() %>%
+    mutate(label = Y_test + 1, max_prob = max.col(., "last"))
+acc_ensemble_xgb_test = sum(xgb_test_prediction$max_prob == xgb_test_prediction$label)/length(xgb_test_prediction$label)
+acc_ensemble_xgb_test
+# # xgboost model diagnostics
+# confusionMatrix(factor(xgb_test_prediction$label),
+#                 factor(xgb_test_prediction$max_prob),
+#                 mode = "everything")
+
+# predict in neural net ensemble model
+test_nn = make_nn_matrix(test_preds)
+ensemble_nn_test_preds = predict_nn(ensemble_nn, X_test)
+ensemble_nn_acc = sum(ensemble_nn_test_preds == Y_test)/length(ensemble_nn_test_preds)
+ensemble_nn_acc
+save(ensemble_nn_test_preds, ensemble_xgb_test_preds, file = "ensemble_test_preds.Rdata")
+
+test_results %<>% rbind(data.frame(model = "acc_ensemble_neuralnet_test", acc = ensemble_nn_acc), data.frame(model = "acc_ensemble_xgboost_test", acc = acc_ensemble_xgb_test)) %>% arrange(desc(acc))
+test_results
+write.csv(test_results, file = "test_results.csv", row.names = FALSE)
+```
+
+```{r}
+
+mm_list[["xgb_ensemble"]] = fetch_multiclass_metrics(labs = xgb_test_prediction$label, preds = xgb_test_prediction$max_prob)
+mm_list[["nn_ensemble"]] = fetch_multiclass_metrics(labs = Y_test, preds=ensemble_nn_test_preds, valid_labs = c(0,1,2,3))
+mm = bind_rows(mm_list, .id = "model")
+mm
+write.csv(mm, file = "multiclass_metrics.csv", row.names = FALSE)
+```
+
+```{r}
+# compare accuracy by subject
+# f_preds = sapply(test_oa_preds, function(x) names(which.max(x)))
+# f_sub = acc_by_subject(flat_scruct_predict[["oa_pred_df"]], f_preds)
+# cl_sub = acc_by_subject(cl_preds_test[["oa_pred_df"]], cl_preds_test[["preds"]])
+# ml_sub = acc_by_subject(ml_preds_test[["oa_pred_df"]], ml_preds_test[["preds"]])
+# bl_sub = acc_by_subject(bl_preds_test[["oa_pred_df"]], bl_preds_test[["preds"]])
+# nn_sub = acc_by_subject(flat_test_data, )
+```
+
+```{r}
+library(ggplot2)
+# compare flat model to count-link; this is graphic used in paper (after editing)
+acc_df = merge(f_sub, cl_sub, by = c("SBJCT_CD"))
+acc_df$diff_flat_cl = acc_df$avc_acc.x - acc_df$avc_acc.y
+acc_df %>% ggplot(aes(x = reorder(SBJCT_CD, diff_flat_cl), y = diff_flat_cl, fill = factor(sign(diff_flat_cl)))) + geom_bar(stat = "identity") + ylab("Difference in Accuracy; Flat - Structural Count-Link") + xlab("Course Subject") + scale_fill_discrete(guide=FALSE) + theme(panel.grid.major.x = element_blank(), panel.grid.minor.x = element_blank(), panel.background = element_blank(), axis.text.x=element_text(angle=45, hjust=1, size = rel(0.8)), plot.title = element_text(hjust = 0.5, face = "bold", size = rel(1.2))) + ggtitle("Flat Model vs. Structural Model with Count-Link: Difference in Accuracy by Subject")
+
+
+
+```
+
+```{r}
+res = gpa_model_predict(flat_test_data$PREV_TERM_CUM_GPA)
+res = factor(res)
+test_labs = flat_test_data$CRSE_GRD_OFFCL_CD
+sum(res == test_labs)/length(test_labs)
+mm_list[["baseline_cum_gpa"]] = fetch_multiclass_metrics(test_labs, res)
+mm_list[["baseline_majority_class"]] = fetch_multiclass_metrics(test_labs, rep("A", length(test_labs)))
+mm = bind_rows(mm_list, .id = "model")
+mm
+write.csv(mm, file = "multiclass_metrics.csv", row.names = FALSE)
+```
