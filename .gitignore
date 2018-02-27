@@ -1,0 +1,7 @@
+*.Rdata
+*.Rhistory
+*.history
+nw_feats*
+nw_v2
+nw_lak_version
+
